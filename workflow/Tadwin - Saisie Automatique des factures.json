@@ -1,0 +1,426 @@
+{
+  "name": "Tadwin - Saisie Automatique des factures",
+  "nodes": [
+    {
+      "parameters": {
+        "formTitle": "Formulaire : Importation de facture",
+        "formFields": {
+          "values": [
+            {
+              "fieldLabel": "facture",
+              "fieldType": "file"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [
+        -576,
+        -64
+      ],
+      "id": "4d8f659c-a476-419f-a15c-fff71f9b2d21",
+      "name": "On form submission",
+      "webhookId": "1f801017-49d7-4d89-bdee-ce8182478249"
+    },
+    {
+      "parameters": {
+        "operation": "pdf",
+        "binaryPropertyName": "=facture",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1.1,
+      "position": [
+        -352,
+        -64
+      ],
+      "id": "a740d335-cd61-4bac-ae82-41aab1bcc418",
+      "name": "Extract from File"
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-3.1-flash-lite",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.1,
+      "position": [
+        -56,
+        168
+      ],
+      "id": "5e59ef2b-7420-4cb2-b74d-8eb925656bfe",
+      "name": "Google Gemini Chat Model",
+      "credentials": {
+        "googlePalmApi": {
+          "id": "8Dv0pyCNq1PmSBoc",
+          "name": "Google Gemini(PaLM) Api account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// =====================================================================\n// Nœud Code n8n : \"Générer écriture\"\n// Mode : Run Once for All Items   |   Langage : JavaScript\n//\n// Les noms entre $('...') doivent correspondre EXACTEMENT au nom de vos nœuds :\n//   - \"Extraire données\"   -> nœud Information Extractor\n//   - \"Lire Fournisseurs\"  -> Google Sheets, Get Row(s), onglet Fournisseurs\n//   - \"Lire Journal\"       -> Google Sheets, Get Row(s), onglet Journal\n//     (activez \"Always Output Data\" dans Settings de ces deux nœuds Sheets,\n//      sinon le workflow s'arrête quand le Journal est vide)\n//\n// Sortie : 3 lignes (charge, TVA, fournisseur) à ajouter dans l'onglet Journal.\n// =====================================================================\n\nconst f = $('Extraire données').first().json.output;\nconst fournisseurs = $('Lire Fournisseurs').all().map(i => i.json).filter(r => r.Nom);\nconst journal = $('Lire Journal').all().map(i => i.json).filter(r => r.N_Facture);\n\n// ---------- Utilitaires ----------\n// Convertit \"4 250,00\", \"4,250.00\" ou 4250 en nombre\nfunction num(v) {\n  if (typeof v === 'number') return v;\n  if (v === null || v === undefined || v === '') return NaN;\n  let s = String(v).replace(/[^\\d,.\\-]/g, '');\n  if (s.includes(',') && s.includes('.')) {\n    s = s.lastIndexOf(',') > s.lastIndexOf('.') ? s.replace(/\\./g, '').replace(',', '.') : s.replace(/,/g, '');\n  } else if (s.includes(',')) {\n    s = s.replace(',', '.');\n  }\n  return parseFloat(s);\n}\nconst r2 = x => Math.round(x * 100) / 100;\n// Nom normalisé : minuscules, sans accents, sans forme juridique ni ponctuation\nconst norm = s => String(s || '')\n  .normalize('NFD').replace(/[̀-ͯ]/g, '')\n  .toLowerCase()\n  .replace(/\\b(sarl au|sarl|s\\.a\\.r\\.l|sa|sas|ste|societe)\\b/g, '')\n  .replace(/[^a-z0-9]/g, '');\nconst digits = s => String(s || '').replace(/\\D/g, '');\n\n// ---------- Données extraites ----------\nconst ht = num(f.montant_ht);\nconst tva = num(f.montant_tva);\nconst ttc = num(f.montant_ttc);\nconst taux = num(f.taux_tva);\nconst numFacture = String(f.numero_facture || '').trim();\nconst date = f.date_facture || '';\n\n// ---------- Recherche du fournisseur (ICE d'abord, puis nom) ----------\nconst connu = fournisseurs.find(r => digits(r.ICE) && digits(r.ICE) === digits(f.fournisseur_ice))\n           || fournisseurs.find(r => norm(r.Nom) === norm(f.fournisseur_nom));\n\nconst nomFournisseur = connu ? connu.Nom : f.fournisseur_nom;\nconst compteCharge = connu ? String(connu.Compte) : String(f.compte_suggere || '');\n\n// ---------- Contrôles ----------\nconst anomalies = [];\n\nif ([ht, tva, ttc].some(isNaN)) anomalies.push('Montants illisibles');\nif (!numFacture) anomalies.push('Numéro de facture manquant');\nif (!/^\\d{4}-\\d{2}-\\d{2}$/.test(date)) anomalies.push('Date invalide');\n\nif (!isNaN(ht) && !isNaN(tva) && !isNaN(ttc) && Math.abs(r2(ht + tva) - ttc) > 0.05) {\n  anomalies.push(`HT + TVA = ${r2(ht + tva)} mais TTC facture = ${ttc}`);\n}\nif (!isNaN(ht) && !isNaN(tva) && !isNaN(taux) && Math.abs(r2(ht * taux / 100) - tva) > 0.05) {\n  anomalies.push(`TVA ${taux}% de ${ht} = ${r2(ht * taux / 100)} mais TVA facture = ${tva}`);\n}\n// Taux de TVA en vigueur selon l'année (réforme 2024-2026 : le 14 % disparaît,\n// le transport passe à 10 %, l'électricité à 20 %). À vérifier sur tax.gov.ma.\nconst TAUX_PAR_ANNEE = {\n  2024: [0, 7, 8, 10, 13, 14, 16, 20],\n  2025: [0, 7, 9, 10, 12, 14, 18, 20],\n  2026: [0, 7, 10, 20],\n};\nconst annee = parseInt(String(date).slice(0, 4), 10);\nconst tauxValides = TAUX_PAR_ANNEE[annee] || TAUX_PAR_ANNEE[2026];\nif (!isNaN(taux) && !tauxValides.includes(taux)) {\n  anomalies.push(`Taux de TVA ${taux}% non applicable en ${annee || 'cette année'}`);\n}\n\nconst doublon = journal.some(r =>\n  String(r.N_Facture).trim().toLowerCase() === numFacture.toLowerCase() &&\n  norm(r.Fournisseur) === norm(nomFournisseur));\nif (doublon) anomalies.push('Doublon : facture déjà enregistrée');\n\nif (!connu) anomalies.push(`Nouveau fournisseur : compte ${compteCharge || '?'} proposé par l'IA`);\nif (!/^6\\d{3,}$/.test(compteCharge)) anomalies.push('Compte de charge invalide');\n\n// ---------- Écriture d'achat ----------\n// On passe les montants lus sur la facture. Le crédit fournisseur = TTC facturé ;\n// si la facture est fausse, l'écriture est déséquilibrée et marquée \"À vérifier\".\nconst lignes = [\n  { Compte: compteCharge, Libelle: f.description || 'Achat', Debit: r2(ht), Credit: '' },\n  { Compte: '34552', Libelle: `TVA récupérable ${taux}%`, Debit: r2(tva), Credit: '' },\n  { Compte: '4411', Libelle: `Fournisseur ${nomFournisseur}`, Debit: '', Credit: r2(ttc) },\n];\n\nconst totalDebit = r2(lignes.reduce((s, l) => s + (num(l.Debit) || 0), 0));\nconst totalCredit = r2(lignes.reduce((s, l) => s + (num(l.Credit) || 0), 0));\nif (Math.abs(totalDebit - totalCredit) > 0.05) {\n  anomalies.push(`Écriture déséquilibrée : débit ${totalDebit} / crédit ${totalCredit}`);\n}\n\nconst statut = anomalies.length ? 'À vérifier' : 'Validé';\nconst motif = anomalies.join(' | ');\n\nreturn lignes.map(l => ({\n  json: {\n    Date: date,\n    Journal: 'ACH',\n    N_Piece: `ACH-${numFacture}`,\n    Fournisseur: nomFournisseur,\n    N_Facture: numFacture,\n    Compte: l.Compte,\n    Libelle: l.Libelle,\n    Debit: l.Debit,\n    Credit: l.Credit,\n    Statut: statut,\n    Motif: motif,\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        672,
+        -64
+      ],
+      "id": "4d3a33b3-4529-4bcf-add5-bc32736cf0e9",
+      "name": "Générer écriture"
+    },
+    {
+      "parameters": {
+        "text": "={{ $json.text }}",
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"fournisseur_nom\":  { \"type\": \"string\", \"description\": \"Raison sociale de l'émetteur de la facture (le vendeur), pas le client\" },\n    \"fournisseur_ice\":  { \"type\": \"string\", \"description\": \"ICE du fournisseur, 15 chiffres, sans espaces\" },\n    \"numero_facture\":   { \"type\": \"string\", \"description\": \"Numéro de la facture tel qu'imprimé\" },\n    \"date_facture\":     { \"type\": \"string\", \"description\": \"Date de la facture au format AAAA-MM-JJ\" },\n    \"montant_ht\":       { \"type\": \"number\", \"description\": \"Total hors taxes\" },\n    \"taux_tva\":         { \"type\": \"number\", \"description\": \"Taux de TVA en pourcentage, ex. 20 ou 14\" },\n    \"montant_tva\":      { \"type\": \"number\", \"description\": \"Montant de la TVA\" },\n    \"montant_ttc\":      { \"type\": \"number\", \"description\": \"Total TTC tel qu'imprimé, même s'il semble faux\" },\n    \"description\":      { \"type\": \"string\", \"description\": \"Libellé court de l'achat, 3 à 6 mots\" },\n    \"compte_suggere\":   { \"type\": \"string\", \"description\": \"Compte de charge PCGE choisi dans la liste autorisée\" }\n  },\n  \"required\": [\"fournisseur_nom\", \"numero_facture\", \"date_facture\", \"montant_ht\", \"taux_tva\", \"montant_tva\", \"montant_ttc\", \"description\", \"compte_suggere\"]\n}",
+        "options": {
+          "systemPromptTemplate": "Tu es un assistant comptable marocain. Tu extrais les données d'une facture d'achat.\nRègles :\n- Le fournisseur est l'émetteur de la facture. Le client \"Argan Digital SARL\" n'est jamais le fournisseur.\n- Recopie les montants exactement comme imprimés, même s'ils semblent incohérents. Ne corrige rien.\n- Convertis les montants en nombres (ex. \"4 250,00 MAD\" -> 4250).\n- Pour compte_suggere, choisis UNIQUEMENT dans cette liste :\n  6111 Achats de marchandises\n  6125 Achats non stockés de matières et fournitures (bureau, eau, électricité)\n  6126 Achats de travaux, études et prestations de services\n  6131 Locations et charges locatives\n  6133 Entretien et réparations\n  6134 Primes d'assurances\n  6136 Rémunérations d'intermédiaires et honoraires\n  6142 Transports\n  6143 Déplacements, missions et réceptions\n  6144 Publicité, publications et relations publiques\n  6145 Frais postaux et frais de télécommunications\n  6147 Services bancaires"
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.informationExtractor",
+      "typeVersion": 1.2,
+      "position": [
+        -128,
+        -64
+      ],
+      "id": "ee14152a-c807-400c-8df4-64d229fdb043",
+      "name": "Extraire données"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "19CtFKv6fJjM2LZY4fuR4ktoZFhmsDjSLthEOEPjtvlg",
+          "mode": "list",
+          "cachedResultName": "comptabilite_n8n",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/19CtFKv6fJjM2LZY4fuR4ktoZFhmsDjSLthEOEPjtvlg/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1378642613,
+          "mode": "list",
+          "cachedResultName": "Fournisseurs",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/19CtFKv6fJjM2LZY4fuR4ktoZFhmsDjSLthEOEPjtvlg/edit#gid=1378642613"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        224,
+        -64
+      ],
+      "id": "7757c3c0-8aae-4959-914f-22b5edd346b0",
+      "name": "Lire Fournisseurs",
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "KrDRiklOExPuKiFq",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "19CtFKv6fJjM2LZY4fuR4ktoZFhmsDjSLthEOEPjtvlg",
+          "mode": "list",
+          "cachedResultName": "comptabilite_n8n",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/19CtFKv6fJjM2LZY4fuR4ktoZFhmsDjSLthEOEPjtvlg/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 847286936,
+          "mode": "list",
+          "cachedResultName": "Journal",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/19CtFKv6fJjM2LZY4fuR4ktoZFhmsDjSLthEOEPjtvlg/edit#gid=847286936"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        448,
+        -64
+      ],
+      "id": "2eff7bb5-2561-4e77-b098-a1334a0b0eee",
+      "name": "Lire Journal",
+      "alwaysOutputData": true,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "KrDRiklOExPuKiFq",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "19CtFKv6fJjM2LZY4fuR4ktoZFhmsDjSLthEOEPjtvlg",
+          "mode": "list",
+          "cachedResultName": "comptabilite_n8n",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/19CtFKv6fJjM2LZY4fuR4ktoZFhmsDjSLthEOEPjtvlg/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 847286936,
+          "mode": "list",
+          "cachedResultName": "Journal",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/19CtFKv6fJjM2LZY4fuR4ktoZFhmsDjSLthEOEPjtvlg/edit#gid=847286936"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "Date",
+              "displayName": "Date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Journal",
+              "displayName": "Journal",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "N_Piece",
+              "displayName": "N_Piece",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Fournisseur",
+              "displayName": "Fournisseur",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "N_Facture",
+              "displayName": "N_Facture",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Compte",
+              "displayName": "Compte",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Libelle",
+              "displayName": "Libelle",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Debit",
+              "displayName": "Debit",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Credit",
+              "displayName": "Credit",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Statut",
+              "displayName": "Statut",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "Motif",
+              "displayName": "Motif",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        896,
+        -64
+      ],
+      "id": "b6e5f670-06d6-4d3a-91de-0504dc9faa1c",
+      "name": "Ajouter au Journal",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "KrDRiklOExPuKiFq",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "completion",
+        "completionTitle": "Facture traitée",
+        "completionMessage": "={{ $('Générer écriture').first().json.Statut }} : {{ $('Générer écriture').first().json.N_Piece }}\n{{ $('Générer écriture').first().json.Motif || 'Écriture enregistrée dans le journal.' }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.form",
+      "typeVersion": 2.5,
+      "position": [
+        1120,
+        -64
+      ],
+      "id": "8a40878d-f092-4bd7-8568-e87920fcdb96",
+      "name": "Form",
+      "webhookId": "59ec9ec4-25df-4865-9285-4ce541a824c2",
+      "executeOnce": true
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "On form submission": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Extraire données",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Extraire données",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extraire données": {
+      "main": [
+        [
+          {
+            "node": "Lire Fournisseurs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lire Fournisseurs": {
+      "main": [
+        [
+          {
+            "node": "Lire Journal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lire Journal": {
+      "main": [
+        [
+          {
+            "node": "Générer écriture",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Générer écriture": {
+      "main": [
+        [
+          {
+            "node": "Ajouter au Journal",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ajouter au Journal": {
+      "main": [
+        [
+          {
+            "node": "Form",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "e0547e77-0d36-49c4-8fac-6ad324c1ae15",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "17ccc48b01e904e03099ca8a9295ae838744adfb537918035ef01f9de4a12f50"
+  },
+  "nodeGroups": [],
+  "id": "wtDwoUIHHUMTCsNc",
+  "tags": []
+}
